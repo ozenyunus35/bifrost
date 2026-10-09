@@ -50,6 +50,15 @@ type Entry struct {
 	Architecture    *schemas.Architecture `json:"architecture,omitempty"`
 	IsDeprecated    bool                  `json:"is_deprecated,omitempty"`
 
+	// InputCostPerTokenDecisions and OutputCostPerTokenDecisions price decision
+	// requests on a model whose row is another mode (OpenAI's gpt-6-luna is a
+	// chat row served natively on /v1/decisions). They stay off Options on
+	// purpose: a Decisions-scoped override patches InputCostPerToken and
+	// OutputCostPerToken, so they are not part of the override patch shape.
+	// See decisionRates for how they are applied.
+	InputCostPerTokenDecisions  *float64 `json:"input_cost_per_token_decisions,omitempty"`
+	OutputCostPerTokenDecisions *float64 `json:"output_cost_per_token_decisions,omitempty"`
+
 	// AdditionalAttributes carries editorial metadata stored on the pricing
 	// row (e.g. description). Populated from the DB read path only; the
 	// json:"-" tag prevents URL datasheet payloads from ever feeding into
@@ -491,6 +500,10 @@ func normalizeRequestType(reqType schemas.RequestType) string {
 // API. Many models carry a datasheet row under only one of the two modes (e.g.
 // bedrock's openai.gpt-5.5 ships as responses-only), so a lookup that misses in
 // its own mode retries under the counterpart rather than pricing at zero.
+// Decision requests retry under chat: a model served natively on a decisions
+// endpoint carries its decision rates on its chat row (see decisionRates), and
+// one answered by emulation is billed as the chat call it is. A model with
+// only a responses row stays unpriced for decisions.
 // Returns false for request types with no such counterpart.
 func chatResponsesFallbackMode(reqType schemas.RequestType) (string, bool) {
 	switch reqType {
@@ -498,6 +511,8 @@ func chatResponsesFallbackMode(reqType schemas.RequestType) (string, bool) {
 		return normalizeRequestType(schemas.ChatCompletionRequest), true
 	case schemas.ChatCompletionRequest, schemas.ChatCompletionStreamRequest:
 		return normalizeRequestType(schemas.ResponsesRequest), true
+	case schemas.DecisionRequest:
+		return normalizeRequestType(schemas.ChatCompletionRequest), true
 	}
 	return "", false
 }
@@ -702,6 +717,9 @@ func convertEntryToTablePricing(modelKey string, entry Entry) configstoreTables.
 		MaxOutputTokens: entry.MaxOutputTokens,
 		Architecture:    entry.Architecture,
 		IsDeprecated:    entry.IsDeprecated,
+
+		InputCostPerTokenDecisions:  entry.InputCostPerTokenDecisions,
+		OutputCostPerTokenDecisions: entry.OutputCostPerTokenDecisions,
 
 		InputCostPerToken:                          entry.InputCostPerToken,
 		OutputCostPerToken:                         entry.OutputCostPerToken,
@@ -976,6 +994,9 @@ func convertTablePricingToEntry(pricing *configstoreTables.TableModelPricing) *E
 		IsDeprecated:         pricing.IsDeprecated,
 		AdditionalAttributes: pricing.AdditionalAttributes,
 		Options:              options,
+
+		InputCostPerTokenDecisions:  pricing.InputCostPerTokenDecisions,
+		OutputCostPerTokenDecisions: pricing.OutputCostPerTokenDecisions,
 	}
 	return entry
 }

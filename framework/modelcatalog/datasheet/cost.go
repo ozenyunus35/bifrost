@@ -1254,14 +1254,55 @@ func computeRerankCost(pricing *configstoreTables.TableModelPricing, usage *sche
 // input tokens only, so the output rate is normally zero, but both sides are
 // honored from the datasheet so a provider that later charges output stays
 // correct without a code change.
+//
+// A negative rate is the datasheet's marker for a model with no fixed price
+// (e.g. openrouter/typesafe/jev-router at -1), so it is left unpriced rather
+// than billed as a negative cost.
 func computeDecisionCost(pricing *configstoreTables.TableModelPricing, usage *schemas.BifrostLLMUsage, tier serviceTier) *schemas.BifrostCost {
 	if usage == nil {
 		return nil
 	}
 	tierTokens := usage.PromptTokens
-	inputCost := float64(usage.PromptTokens) * tieredInputRate(pricing, tierTokens, tier)
-	outputCost := float64(usage.CompletionTokens) * tieredOutputRate(pricing, tierTokens, tier)
+	inputRate := tieredInputRate(pricing, tierTokens, tier)
+	outputRate := tieredOutputRate(pricing, tierTokens, tier)
+	if inputRate < 0 || outputRate < 0 {
+		return nil
+	}
+	inputCost := float64(usage.PromptTokens) * inputRate
+	outputCost := float64(usage.CompletionTokens) * outputRate
 	return newInputOutputCost(inputCost, outputCost)
+}
+
+// decisionRates returns the row a decision request is priced from. When the
+// request is a decision and the row carries decision rates, it is a copy keyed
+// like the original but with InputCostPerToken and OutputCostPerToken set to
+// those rates (a missing side bills as zero, as Typesafe bills input only). The
+// copy carries none of the row's tier or service-tier rates, so a chat tier
+// such as above-272k cannot override a flat decision rate, and keeps only the
+// row-level modifiers computeCostFromInput reads: CostPerRequest, the off-peak
+// multiplier and its peak hours. Any other request, or a row with no decision
+// rates (Typesafe's decisions rows, or a chat row of a model answered by
+// emulation), is returned unchanged and priced at the row's own rates.
+//
+// It runs before applyPricingOverrides so a Decisions-scoped override, which
+// patches InputCostPerToken and OutputCostPerToken, applies on top of either.
+// The rate pointers are shared with the cached pricing row, so they are only
+// read here, never written through.
+func decisionRates(requestType schemas.RequestType, pricing configstoreTables.TableModelPricing) configstoreTables.TableModelPricing {
+	if requestType != schemas.DecisionRequest || (pricing.InputCostPerTokenDecisions == nil && pricing.OutputCostPerTokenDecisions == nil) {
+		return pricing
+	}
+	return configstoreTables.TableModelPricing{
+		Model:                 pricing.Model,
+		BaseModel:             pricing.BaseModel,
+		Provider:              pricing.Provider,
+		Mode:                  normalizeRequestType(requestType),
+		InputCostPerToken:     pricing.InputCostPerTokenDecisions,
+		OutputCostPerToken:    pricing.OutputCostPerTokenDecisions,
+		CostPerRequest:        pricing.CostPerRequest,
+		OffPeakCostMultiplier: pricing.OffPeakCostMultiplier,
+		PeakHours:             pricing.PeakHours,
+	}
 }
 
 // newInputOutputCost builds a BifrostCost from separate input and output costs,
@@ -2237,7 +2278,7 @@ func (s *Store) resolvePricing(routingInfo schemas.RoutingInfo, requestType sche
 		}
 		base, exists := s.getBasePricing(candidate, catalogProvider, requestType)
 		if exists && base != nil {
-			result, _ := s.applyPricingOverrides(overrideKey, requestType, *base, scopes)
+			result, _ := s.applyPricingOverrides(overrideKey, requestType, decisionRates(requestType, *base), scopes)
 			return &result
 		}
 		s.logger.Debug("pricing not found for %s, trying next candidate", candidate)
@@ -2262,6 +2303,7 @@ func (s *Store) resolvePricing(routingInfo schemas.RoutingInfo, requestType sche
 //   - Bedrock: prepends the vendor namespace ("anthropic.", "openai.", "google.", "xai.") inferred from the model family, then falls back to the counterpart chat/responses mode.
 //   - Bedrock Mantle: folded onto the "bedrock" provider up front (datasheet rows for all Bedrock variants are stored there), so it shares every Bedrock fallback.
 //   - All providers: chat and responses requests retry in each other's mode, since a model served over both APIs often has a datasheet row under only one of them.
+//   - All providers: decision requests retry in chat mode, since a decision served natively or by emulation is priced from the model's chat row.
 //   - All providers: for ImageEdit/ImageVariation requests, retries the lookup in image-generation mode.
 //   - All providers: live requests retry in "realtime" mode, where the datasheet feed files GPT Live models.
 //
