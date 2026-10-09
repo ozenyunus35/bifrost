@@ -251,3 +251,45 @@ func TestConfigForceReasoningOnlyModelsToResponsesDefaultsOn(t *testing.T) {
 		t.Error("force_reasoning_only_models_to_responses should default to true when absent")
 	}
 }
+
+// TestPluginConvertParamsHandsFitToCore pins should_convert_params: the plugin
+// only asks core to fit the values (core does it at dispatch, once key selection
+// has resolved the model each attempt reaches) and leaves the request as sent.
+func TestPluginConvertParamsHandsFitToCore(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      Config
+		override bool
+		want     bool
+	}{
+		{name: "config on", cfg: Config{ShouldConvertParams: true}, want: true},
+		{name: "header override on", override: true, want: true},
+		{name: "off"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := Init(tt.cfg, bifrost.NewNoOpLogger(), nil)
+			if err != nil {
+				t.Fatalf("Init: %v", err)
+			}
+			ctx := newTestContext()
+			if tt.override {
+				ctx.SetValue(schemas.BifrostContextKeyCompatShouldConvertParams, true)
+			}
+			req := newResponsesRequest(schemas.Gemini, "gemini-2.5-pro", &schemas.ResponsesParameters{
+				MaxOutputTokens: new(1000000),
+				Reasoning:       &schemas.ResponsesParametersReasoning{MaxTokens: new(64000)},
+			})
+			got, _, err := p.PreLLMHook(ctx, req)
+			if err != nil {
+				t.Fatalf("PreLLMHook: %v", err)
+			}
+			if enabled, _ := ctx.Value(schemas.BifrostContextKeyConvertParamValues).(bool); enabled != tt.want {
+				t.Errorf("convert-param-values flag = %v, want %v", enabled, tt.want)
+			}
+			if params := got.ResponsesRequest.Params; *params.MaxOutputTokens != 1000000 || *params.Reasoning.MaxTokens != 64000 {
+				t.Errorf("plugin changed the request: max=%d budget=%d", *params.MaxOutputTokens, *params.Reasoning.MaxTokens)
+			}
+		})
+	}
+}

@@ -8444,7 +8444,7 @@ func prepareResponsesRequest(ctx *schemas.BifrostContext, config *schemas.Provid
 		}
 	}
 	// Last, so tools hoisted out of additional_tools items and namespaces are normalized too.
-	return normalizeResponsesToolSchemas(ctx, provider.GetProviderKey(), r), nil
+	return fitResponsesOutputTokens(ctx, provider.GetProviderKey(), normalizeResponsesToolSchemas(ctx, provider.GetProviderKey(), r)), nil
 }
 
 // normalizeResponsesToolSchemas applies toolSchemaPolicy to the request's tool
@@ -8497,6 +8497,84 @@ func normalizeChatToolSchemas(ctx *schemas.BifrostContext, provider schemas.Mode
 	return &cp
 }
 
+// fitChatOutputTokens fits the output cap and thinking budget to the attempt's resolved model when a plugin asks (compat should_convert_params); copy-on-write.
+func fitChatOutputTokens(ctx *schemas.BifrostContext, provider schemas.ModelProvider, r *schemas.BifrostChatRequest) *schemas.BifrostChatRequest {
+	if enabled, _ := ctx.Value(schemas.BifrostContextKeyConvertParamValues).(bool); !enabled || r == nil || r.Params == nil {
+		return r
+	}
+	var budget *int
+	if r.Params.Reasoning != nil {
+		budget = r.Params.Reasoning.MaxTokens
+	}
+	if r.Params.MaxCompletionTokens == nil && budget == nil {
+		return r
+	}
+	caps := schemas.ResolveModelCaps(schemas.ResolveBaseProvider(ctx, provider), schemas.ResolveCanonicalModel(ctx, r.Model))
+	maxTokens, budget, changes := providerUtils.FitOutputTokens(caps, "max_completion_tokens", r.Params.MaxCompletionTokens, budget)
+	if len(changes) == 0 {
+		return r
+	}
+	ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelWarn, fmt.Sprintf("converted %d param value(s) to fit model %s: %s", len(changes), r.Model, strings.Join(changes, ", ")))
+	params := *r.Params
+	params.MaxCompletionTokens = maxTokens
+	if params.Reasoning != nil {
+		reasoning := *params.Reasoning
+		reasoning.MaxTokens = budget
+		params.Reasoning = &reasoning
+	}
+	cp := *r
+	cp.Params = &params
+	return &cp
+}
+
+// fitResponsesOutputTokens is the Responses parallel of fitChatOutputTokens.
+func fitResponsesOutputTokens(ctx *schemas.BifrostContext, provider schemas.ModelProvider, r *schemas.BifrostResponsesRequest) *schemas.BifrostResponsesRequest {
+	if enabled, _ := ctx.Value(schemas.BifrostContextKeyConvertParamValues).(bool); !enabled || r == nil || r.Params == nil {
+		return r
+	}
+	var budget *int
+	if r.Params.Reasoning != nil {
+		budget = r.Params.Reasoning.MaxTokens
+	}
+	if r.Params.MaxOutputTokens == nil && budget == nil {
+		return r
+	}
+	caps := schemas.ResolveModelCaps(schemas.ResolveBaseProvider(ctx, provider), schemas.ResolveCanonicalModel(ctx, r.Model))
+	maxTokens, budget, changes := providerUtils.FitOutputTokens(caps, "max_output_tokens", r.Params.MaxOutputTokens, budget)
+	if len(changes) == 0 {
+		return r
+	}
+	ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelWarn, fmt.Sprintf("converted %d param value(s) to fit model %s: %s", len(changes), r.Model, strings.Join(changes, ", ")))
+	params := *r.Params
+	params.MaxOutputTokens = maxTokens
+	if params.Reasoning != nil {
+		reasoning := *params.Reasoning
+		reasoning.MaxTokens = budget
+		params.Reasoning = &reasoning
+	}
+	cp := *r
+	cp.Params = &params
+	return &cp
+}
+
+// fitTextCompletionOutputTokens is the Text Completions parallel of fitChatOutputTokens; text carries no budget.
+func fitTextCompletionOutputTokens(ctx *schemas.BifrostContext, provider schemas.ModelProvider, r *schemas.BifrostTextCompletionRequest) *schemas.BifrostTextCompletionRequest {
+	if enabled, _ := ctx.Value(schemas.BifrostContextKeyConvertParamValues).(bool); !enabled || r == nil || r.Params == nil || r.Params.MaxTokens == nil {
+		return r
+	}
+	caps := schemas.ResolveModelCaps(schemas.ResolveBaseProvider(ctx, provider), schemas.ResolveCanonicalModel(ctx, r.Model))
+	maxTokens, _, changes := providerUtils.FitOutputTokens(caps, "max_tokens", r.Params.MaxTokens, nil)
+	if len(changes) == 0 {
+		return r
+	}
+	ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelWarn, fmt.Sprintf("converted %d param value(s) to fit model %s: %s", len(changes), r.Model, strings.Join(changes, ", ")))
+	params := *r.Params
+	params.MaxTokens = maxTokens
+	cp := *r
+	cp.Params = &params
+	return &cp
+}
+
 // moonshotSchemaFormats is the string `format` allowlist kimi-k3's tool validator
 // accepts, verified on Bedrock 2026-10-08; any other value fails the request.
 var moonshotSchemaFormats = []string{"date", "date-time", "time", "duration", "email", "hostname", "ipv4", "ipv6", "uri", "uuid"}
@@ -8525,7 +8603,7 @@ func toolSchemaPolicy(caps schemas.ModelCaps) providerUtils.ToolSchemaPolicy {
 
 // prepareChatRequest is the Chat Completions parallel of prepareResponsesRequest.
 func prepareChatRequest(ctx *schemas.BifrostContext, config *schemas.ProviderConfig, provider schemas.ModelProvider, r *schemas.BifrostChatRequest) *schemas.BifrostChatRequest {
-	return normalizeChatToolSchemas(ctx, provider, promptCacheChatRequest(ctx, config, provider, r))
+	return fitChatOutputTokens(ctx, provider, normalizeChatToolSchemas(ctx, provider, promptCacheChatRequest(ctx, config, provider, r)))
 }
 
 // promptCacheChatRequest is the Chat Completions parallel of
@@ -8586,7 +8664,7 @@ func (bifrost *Bifrost) handleProviderRequest(provider schemas.Provider, config 
 				break
 			}
 		}
-		textCompletionResponse, bifrostError := provider.TextCompletion(req.Context, key, req.BifrostRequest.TextCompletionRequest)
+		textCompletionResponse, bifrostError := provider.TextCompletion(req.Context, key, fitTextCompletionOutputTokens(req.Context, provider.GetProviderKey(), req.BifrostRequest.TextCompletionRequest))
 		if bifrostError != nil {
 			return nil, bifrostError
 		}
@@ -9027,7 +9105,7 @@ func (bifrost *Bifrost) handleProviderStreamRequest(provider schemas.Provider, c
 				return provider.ChatCompletionStream(req.Context, wrapConvertedStreamPostHookRunner(postHookRunner, schemas.ChatCompletionRequest), postHookSpanFinalizer, key, prepareChatRequest(req.Context, config, provider.GetProviderKey(), chatRequest))
 			}
 		}
-		return provider.TextCompletionStream(req.Context, postHookRunner, postHookSpanFinalizer, key, req.BifrostRequest.TextCompletionRequest)
+		return provider.TextCompletionStream(req.Context, postHookRunner, postHookSpanFinalizer, key, fitTextCompletionOutputTokens(req.Context, provider.GetProviderKey(), req.BifrostRequest.TextCompletionRequest))
 	case schemas.ChatCompletionStreamRequest:
 		if bifrostError := routeChatReasoningMode(req.Context, provider, req.BifrostRequest.ChatRequest); bifrostError != nil {
 			return nil, bifrostError

@@ -4405,6 +4405,119 @@ func TestToolSchemaPolicy_DatasheetRowWins(t *testing.T) {
 	}
 }
 
+// opusSizedChatRequest is a chat request sized for a 128K-output Claude model.
+func opusSizedChatRequest(model string) *schemas.BifrostChatRequest {
+	return &schemas.BifrostChatRequest{
+		Provider: schemas.Anthropic,
+		Model:    model,
+		Params: &schemas.ChatParameters{
+			MaxCompletionTokens: new(128000),
+			Reasoning:           &schemas.ChatReasoning{MaxTokens: new(100000)},
+		},
+	}
+}
+
+// With convert-param-values on (compat's should_convert_params), dispatch fits an
+// Opus-sized request to the model each attempt reaches: Haiku gets its 64K ceiling
+// and a budget scaled with it, and the fallback after it still sees the caller's
+// values. With it off the request goes out as sent.
+func TestDispatchFitsOutputTokensPerAttempt(t *testing.T) {
+	off := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	req := opusSizedChatRequest("claude-haiku-4-5-20251001")
+	if out := prepareChatRequest(off, nil, schemas.Anthropic, req); out != req {
+		t.Fatal("without the flag the request must be returned as-is")
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyConvertParamValues, true)
+	provider := &chatCapturingProvider{stubProvider: stubProvider{key: schemas.Anthropic}}
+	msg := &ChannelMessage{Context: ctx, BifrostRequest: schemas.BifrostRequest{RequestType: schemas.ChatCompletionRequest, ChatRequest: req}}
+	if _, bifrostErr := (&Bifrost{}).handleProviderRequest(provider, &schemas.ProviderConfig{}, msg, schemas.Key{}, nil); bifrostErr != nil {
+		t.Fatalf("dispatch failed: %v", bifrostErr.Error)
+	}
+	if got := provider.got.Params; *got.MaxCompletionTokens != 64000 || *got.Reasoning.MaxTokens != 50000 {
+		t.Fatalf("haiku attempt got max=%d budget=%d, want 64000/50000", *got.MaxCompletionTokens, *got.Reasoning.MaxTokens)
+	}
+	if *req.Params.MaxCompletionTokens != 128000 || *req.Params.Reasoning.MaxTokens != 100000 {
+		t.Fatal("the caller's request was mutated")
+	}
+	// The change is reported on the request's routing logs; ctx.Log would drop it outside a plugin hook.
+	wantLog := "converted 2 param value(s) to fit model claude-haiku-4-5-20251001: max_completion_tokens: 128000 -> 64000, reasoning.max_tokens: 100000 -> 50000"
+	if logs := ctx.GetRoutingEngineLogs(); !slices.ContainsFunc(logs, func(e schemas.RoutingEngineLogEntry) bool {
+		return e.Engine == schemas.RoutingEngineCore && e.Level == schemas.LogLevelWarn && e.Message == wantLog
+	}) {
+		t.Fatalf("routing logs = %+v, want a core warning %q", logs, wantLog)
+	}
+	if logs := off.GetRoutingEngineLogs(); len(logs) != 0 {
+		t.Fatalf("an unfitted request must log nothing, got %+v", logs)
+	}
+
+	// The next fallback is a shallow copy of the caller's request, as prepareFallbackRequest builds it.
+	fallback := *req
+	fallback.Model = "claude-opus-4-6"
+	if out := prepareChatRequest(ctx, nil, schemas.Anthropic, &fallback); *out.Params.MaxCompletionTokens != 128000 || *out.Params.Reasoning.MaxTokens != 100000 {
+		t.Fatalf("opus fallback got max=%d budget=%d, want the caller's 128000/100000", *out.Params.MaxCompletionTokens, *out.Params.Reasoning.MaxTokens)
+	}
+}
+
+// An aliased deployment is fitted to the model behind the alias, which only key
+// selection knows; that is why the fit runs in dispatch rather than in the plugin.
+func TestPrepareResponsesRequest_FitsOutputTokensToAliasedModel(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyConvertParamValues, true)
+	ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: "team-claude", Config: &schemas.AliasConfig{ModelID: "claude-haiku-4-5-20251001"}})
+	req := &schemas.BifrostResponsesRequest{
+		Provider: schemas.Anthropic,
+		Model:    "team-claude",
+		Params: &schemas.ResponsesParameters{
+			MaxOutputTokens: new(128000),
+			Reasoning:       &schemas.ResponsesParametersReasoning{MaxTokens: new(100000)},
+		},
+	}
+	prepared, bifrostErr := prepareResponsesRequest(ctx, &schemas.ProviderConfig{}, stubProvider{key: schemas.Anthropic}, schemas.Key{}, req)
+	if bifrostErr != nil {
+		t.Fatalf("prepare failed: %v", bifrostErr.Error)
+	}
+	if got := prepared.Params; *got.MaxOutputTokens != 64000 || *got.Reasoning.MaxTokens != 50000 {
+		t.Fatalf("aliased haiku got max=%d budget=%d, want 64000/50000", *got.MaxOutputTokens, *got.Reasoning.MaxTokens)
+	}
+	if *req.Params.MaxOutputTokens != 128000 || *req.Params.Reasoning.MaxTokens != 100000 {
+		t.Fatal("the caller's request was mutated")
+	}
+}
+
+// Text completions carry only a cap, and dispatch fits it the same way.
+func TestHandleProviderRequest_TextCompletionFitsOutputTokens(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyConvertParamValues, true)
+	provider := &textCapturingProvider{stubProvider: stubProvider{key: schemas.Anthropic}}
+	msg := &ChannelMessage{Context: ctx, BifrostRequest: schemas.BifrostRequest{
+		RequestType: schemas.TextCompletionRequest,
+		TextCompletionRequest: &schemas.BifrostTextCompletionRequest{
+			Provider: schemas.Anthropic,
+			Model:    "claude-haiku-4-5-20251001",
+			Params:   &schemas.TextCompletionParameters{MaxTokens: new(128000)},
+		},
+	}}
+	if _, bifrostErr := (&Bifrost{}).handleProviderRequest(provider, &schemas.ProviderConfig{}, msg, schemas.Key{}, nil); bifrostErr != nil {
+		t.Fatalf("dispatch failed: %v", bifrostErr.Error)
+	}
+	if got := *provider.got.Params.MaxTokens; got != 64000 {
+		t.Fatalf("max_tokens = %d, want 64000", got)
+	}
+}
+
+// textCapturingProvider records the Text Completions request dispatch hands the provider.
+type textCapturingProvider struct {
+	stubProvider
+	got *schemas.BifrostTextCompletionRequest
+}
+
+func (p *textCapturingProvider) TextCompletion(_ *schemas.BifrostContext, _ schemas.Key, req *schemas.BifrostTextCompletionRequest) (*schemas.BifrostTextCompletionResponse, *schemas.BifrostError) {
+	p.got = req
+	return &schemas.BifrostTextCompletionResponse{}, nil
+}
+
 // chatCapturingProvider records the Chat request dispatch hands the provider.
 type chatCapturingProvider struct {
 	stubProvider
